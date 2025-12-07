@@ -1,38 +1,81 @@
-# UnityEyes Pretraining Scaffold
+# Gaze Regression: UnityEyes → MPIIFaceGaze
 
-This repo contains a minimal first step to pre-train a gaze regressor on UnityEyes synthetic images before adapting to MPIIFaceGaze or other real-world data.
+This repo pre-trains a ResNet-18 gaze regressor on UnityEyes and fine-tunes it on MPIIFaceGaze, plus a webcam demo for quick sanity checks.
 
 ## Setup
 - Python 3.10+ recommended.
-- Install dependencies: `python3 -m pip install -r requirements.txt`
+- Install deps:
+  ```bash
+  python -m pip install -r requirements.txt
+  python -m pip install opencv-python
+  ```
 
-## UnityEyes data layout
-- Place the UnityEyes dataset locally (not included here).
-- The loader expects image files (`.png`/`.jpg`) with matching JSON labels of the same stem:
+## Data layout
+**UnityEyes**
+- Place UnityEyes locally (not included).
+- Expects image files (`.png`/`.jpg`) with matching JSON labels of the same stem:
   - `some_dir/img_000001.png`
   - `some_dir/img_000001.json` containing a gaze vector (e.g., `eye_details.look_vec`).
-- The code scans all subfolders of `--data-root` for this pattern.
+- The loader scans all subfolders of `--data-root`.
 
-## Run pretraining
-Example run (3 quick epochs to sanity-check the pipeline):
+**MPIIFaceGaze**
+- Root contains participants `p00` … `p14`.
+- Each `pXX` has many `dayYY` image folders and an annotation file `pXX.txt`.
+- We use the annotation fields: eye-corner landmarks (for cropping), face center, gaze target (to form a 3D gaze vector), and the eye side flag (`left`/`right`).
+
+## Pre-train on UnityEyes
+Quick sanity run:
 ```bash
-python3 train_unityeyes.py \
+python train_unityeyes.py \
   --data-root /path/to/UnityEyes \
   --out-dir runs/unityeyes_pretrain \
   --epochs 3 \
   --batch-size 64
 ```
+Key flags: `--no-augment`, `--from-scratch`, `--cpu`, `--val-split`.
 
-Important flags:
-- `--no-augment` to disable color jitter and flips.
-- `--from-scratch` to avoid ImageNet initialization (by default it uses ResNet-18 ImageNet weights).
-- `--cpu` to force CPU if CUDA is present.
+## Fine-tune on MPIIFaceGaze
+```bash
+python finetune_mpiifacegaze.py \
+  --data-root MPIIFaceGaze/MPIIFaceGaze \
+  --checkpoint runs/unityeyes_pretrain/best.pt \
+  --out-dir runs/mpiifacegaze_ft \
+  --epochs 10 \
+  --batch-size 32 \
+  --lr 1e-4
+```
+Helpful flags:
+- `--participants p00 p01 ...` to subset subjects.
+- `--freeze-backbone` to train only the final regressor head.
+- `--no-augment` to disable color jitter.
+- `--cpu` to force CPU.
 
 ## Outputs
-- `runs/unityeyes_pretrain/last.pt`: latest epoch weights.
-- `runs/unityeyes_pretrain/best.pt`: best validation loss weights.
+- `runs/unityeyes_pretrain/{last.pt,best.pt}` from pretraining.
+- `runs/mpiifacegaze_ft/{last.pt,best.pt}` from fine-tuning.
 
-## Next steps
-- Increase `--epochs` and tweak `--val-split` once you confirm labels are read correctly.
-- Add a short per-user calibration layer or fine-tune on MPIIFaceGaze after this pretraining.
-- Consider domain randomization (occlusion, blur, lighting) if UnityEyes → real-world transfer is poor.
+## Webcam demo (dual-eye, coarse screen projection)
+```bash
+python webcam_demo.py \
+  --checkpoint runs/mpiifacegaze_ft/best.pt \
+  --screen-width 1920 --screen-height 1080 --focal-px 900 \
+  --window-width 1600 --window-height 900
+```
+- Detects up to two eyes with a Haar cascade, crops, runs the model, and overlays yaw/pitch.
+- Projects yaw/pitch onto the whole frame as a red dot using a simple pinhole approximation; tune `--focal-px` and make sure screen width/height match your display. (For accurate screen mapping, add head-pose or a short calibration routine.)
+- Press `q` to quit; window is resizable.
+
+## Fullscreen overlay with auto-calibration
+```bash
+python gaze_overlay_fullscreen.py \
+  --checkpoint runs/mpiifacegaze_ft/best.pt \
+  --device cuda --eye both
+```
+- Uses MediaPipe FaceMesh to crop both eyes, averages predictions, and renders a transparent fullscreen dot overlay.
+- Built-in auto-calibration (`c` to start, follow the moving dot) fits an affine map from yaw/pitch to screen XY and smooths outputs; `r` to reset, `q` to quit.
+- Good for quick on-screen gaze visualization; relies on webcam + face mesh quality.
+
+## Tips / next steps
+- Run a longer pretrain/fine-tune once you trust the pipeline; adjust `--val-split` for your hardware.
+- For better real-world mapping, add a brief per-user calibration (collect a few on-screen targets and fit a small regressor on top of the yaw/pitch outputs).
+- If Haar eye detection struggles, improve lighting, move closer, or swap in a face/landmark detector.
