@@ -3,22 +3,12 @@ import time
 from pathlib import Path
 
 import cv2
+import mediapipe as mp
 import numpy as np
 import torch
-from torchvision import transforms as T
 from PIL import Image
+from torchvision import transforms as T
 
-# Optional (for showing cursor + screen mapping)
-try:
-    import pyautogui
-    HAS_PYAUTOGUI = True
-except Exception:
-    HAS_PYAUTOGUI = False
-
-# MediaPipe for face/eye landmarks
-import mediapipe as mp
-
-# Use your exact model definition
 from train_unityeyes import build_model
 
 
@@ -94,6 +84,38 @@ def apply_affine(A, yaw, pitch):
 
 
 # -----------------------------
+# Calibration target helper
+# -----------------------------
+def make_targets(screen_w: int, screen_h: int, n_points: int) -> list[tuple[int, int]]:
+    margin_x = int(screen_w * 0.05)
+    margin_y = int(screen_h * 0.05)
+    xs = [margin_x, screen_w // 2, screen_w - margin_x]
+    ys = [margin_y, screen_h // 2, screen_h - margin_y]
+    grid9 = [(x, y) for y in ys for x in xs]
+    if n_points <= 9:
+        return grid9[:n_points]
+
+    mid_edges = [
+        (screen_w // 2, margin_y),
+        (screen_w // 2, screen_h - margin_y),
+        (margin_x, screen_h // 2),
+        (screen_w - margin_x, screen_h // 2),
+    ]
+    targets = grid9 + mid_edges
+    if n_points <= len(targets):
+        return targets[:n_points]
+
+    # Add inner quadrant points
+    qx1 = int(screen_w * 0.33)
+    qx2 = int(screen_w * 0.67)
+    qy1 = int(screen_h * 0.33)
+    qy2 = int(screen_h * 0.67)
+    inner = [(qx1, qy1), (qx2, qy1), (qx1, qy2), (qx2, qy2)]
+    targets += inner
+    return targets[:n_points]
+
+
+# -----------------------------
 # Main
 # -----------------------------
 def parse_args():
@@ -103,7 +125,14 @@ def parse_args():
     ap.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"])
     ap.add_argument("--eye", type=str, default="both", choices=["left", "right", "both"])
     ap.add_argument("--camera", type=int, default=0)
-    ap.add_argument("--no-cursor", action="store_true", help="Disable cursor display/mapping even if pyautogui is available.")
+    ap.add_argument("--screen-width", type=int, default=1920)
+    ap.add_argument("--screen-height", type=int, default=1080)
+    ap.add_argument("--calib-points", type=int, default=12)
+    ap.add_argument("--calib-settle-ms", type=int, default=400)
+    ap.add_argument("--calib-collect-ms", type=int, default=900)
+    ap.add_argument("--smoothing", type=float, default=0.25, help="EMA on yaw/pitch; 0 disables smoothing")
+    ap.add_argument("--window-width", type=int, default=1280)
+    ap.add_argument("--window-height", type=int, default=720)
     return ap.parse_args()
 
 
@@ -148,28 +177,28 @@ def main():
     if not cap.isOpened():
         raise RuntimeError("Could not open webcam.")
 
-    # Cursor/screen helper
-    use_cursor = (HAS_PYAUTOGUI and (not args.no_cursor))
-    if use_cursor:
-        screen_w, screen_h = pyautogui.size()
-        print(f"Screen: {screen_w} x {screen_h}")
-    else:
-        screen_w, screen_h = None, None
+    screen_w, screen_h = args.screen_width, args.screen_height
+    targets = make_targets(screen_w, screen_h, args.calib_points)
 
-    # Calibration storage
+    # Calibration state
     A = None
-    collecting = False
-    calib_yps = []
-    calib_xys = []
-    calib_target_n = 60  # ~2 seconds worth at ~30fps
+    auto_active = False
+    auto_phase = "idle"  # idle | settle | collect | done
+    auto_idx = 0
+    phase_start_t = time.time()
+    calib_yps: list[tuple[float, float]] = []
+    calib_xys: list[tuple[float, float]] = []
+    prev_yp = None
 
     print("Controls:")
-    print("  q  : quit")
-    print("  c  : start cursor-based calibration (look at your cursor and move it around)")
-    print("  r  : reset calibration")
+    print("  q : quit")
+    print("  c : start auto-calibration (follow the red dot)")
+    print("  r : reset calibration")
 
-    # Mini-map size for screen visualization
     mini_w, mini_h = 220, 160
+
+    cv2.namedWindow("Gaze Demo (UnityEyes -> MPIIFaceGaze)", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Gaze Demo (UnityEyes -> MPIIFaceGaze)", args.window_width, args.window_height)
 
     while True:
         ok, frame = cap.read()
@@ -226,39 +255,54 @@ def main():
                 cv2.rectangle(frame, (l, t), (r, b), (0, 255, 0), 1)
                 cv2.putText(frame, tag, (l, t - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-        # Cursor position
-        mouse_x = mouse_y = None
-        if use_cursor:
-            try:
-                mouse_x, mouse_y = pyautogui.position()
-            except Exception:
-                mouse_x = mouse_y = None
+        # EMA smoothing
+        if yaw_pred is not None:
+            if prev_yp is None or args.smoothing <= 0:
+                prev_yp = (yaw_pred, pitch_pred)
+            else:
+                a = float(np.clip(args.smoothing, 0.0, 1.0))
+                prev_yp = (
+                    a * yaw_pred + (1 - a) * prev_yp[0],
+                    a * pitch_pred + (1 - a) * prev_yp[1],
+                )
+        yp_for_map = prev_yp
 
-        # If calibrating, collect pairs (yaw,pitch) <-> cursor
-        if collecting and yaw_pred is not None and mouse_x is not None:
-            calib_yps.append((yaw_pred, pitch_pred))
-            calib_xys.append((mouse_x, mouse_y))
+        # Auto calibration state machine
+        if auto_active:
+            tgt = targets[auto_idx] if auto_idx < len(targets) else None
+            elapsed_ms = (time.time() - phase_start_t) * 1000.0
 
-            if len(calib_yps) >= calib_target_n:
-                A = fit_affine(calib_yps, calib_xys)
-                collecting = False
-                print("Calibration complete. Affine mapping learned.")
-                print("  Samples used:", len(calib_yps))
+            if tgt is None:
+                if len(calib_yps) >= 6:
+                    A = fit_affine(calib_yps, calib_xys)
+                    print("Auto calibration complete. Samples:", len(calib_yps))
+                else:
+                    print("Auto calibration ended with too few samples.")
+                auto_active = False
+                auto_phase = "done"
+            else:
+                if auto_phase == "settle":
+                    if elapsed_ms >= args.calib_settle_ms:
+                        auto_phase = "collect"
+                        phase_start_t = time.time()
+                elif auto_phase == "collect":
+                    if yp_for_map is not None:
+                        calib_yps.append(yp_for_map)
+                        calib_xys.append(tgt)
+                    if elapsed_ms >= args.calib_collect_ms:
+                        auto_idx += 1
+                        auto_phase = "settle"
+                        phase_start_t = time.time()
 
         # If we have a mapping, compute predicted screen coords
         pred_x = pred_y = None
-        err_px = None
-        if A is not None and yaw_pred is not None:
-            pred_x, pred_y = apply_affine(A, yaw_pred, pitch_pred)
-            if mouse_x is not None:
-                dx = pred_x - mouse_x
-                dy = pred_y - mouse_y
-                err_px = (dx * dx + dy * dy) ** 0.5
+        if A is not None and yp_for_map is not None:
+            pred_x, pred_y = apply_affine(A, yp_for_map[0], yp_for_map[1])
 
         # Overlay text
         y0 = 25
-        if yaw_pred is not None:
-            cv2.putText(frame, f"yaw={yaw_pred:.3f} rad  pitch={pitch_pred:.3f} rad",
+        if yp_for_map is not None:
+            cv2.putText(frame, f"yaw={yp_for_map[0]:.3f} rad  pitch={yp_for_map[1]:.3f} rad",
                         (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
             y0 += 24
         else:
@@ -266,45 +310,57 @@ def main():
                         (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             y0 += 24
 
-        if use_cursor and mouse_x is not None:
-            cv2.putText(frame, f"cursor=({mouse_x},{mouse_y})",
-                        (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            y0 += 24
-
-        if pred_x is not None:
-            cv2.putText(frame, f"pred  =({int(pred_x)},{int(pred_y)})",
-                        (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            y0 += 24
-            if err_px is not None:
-                cv2.putText(frame, f"err   ={err_px:.1f} px",
-                            (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                y0 += 24
-
-        if collecting:
-            cv2.putText(frame, f"CALIBRATING... {len(calib_yps)}/{calib_target_n}",
+        if auto_active:
+            cv2.putText(frame, f"CALIBRATING {auto_idx+1}/{len(targets)} phase={auto_phase}",
                         (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            y0 += 24
+        elif A is not None:
+            cv2.putText(frame, "Calibrated", (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            y0 += 24
+        else:
+            cv2.putText(frame, "Not calibrated (press c)", (10, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            y0 += 24
 
-        # Mini screen map (top-right)
-        if use_cursor:
-            x1 = w - mini_w - 10
-            y1 = 10
-            x2 = x1 + mini_w
-            y2 = y1 + mini_h
-            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255), 1)
+        # Full-frame overlay for target/prediction (fills the window)
+        if screen_w and screen_h:
+            if auto_active and auto_idx < len(targets):
+                tx, ty = targets[auto_idx]
+                ux = np.clip(tx / screen_w, 0, 1)
+                uy = np.clip(ty / screen_h, 0, 1)
+                cx = int(ux * w)
+                cy = int(uy * h)
+                cv2.drawMarker(frame, (cx, cy), (0, 0, 255), cv2.MARKER_TILTED_CROSS, 22, 2)
+                cv2.circle(frame, (cx, cy), 10, (0, 0, 255), 2)
 
-            if mouse_x is not None and screen_w:
-                ux = mouse_x / screen_w
-                uy = mouse_y / screen_h
-                mx = int(x1 + ux * mini_w)
-                my = int(y1 + uy * mini_h)
-                cv2.circle(frame, (mx, my), 4, (0, 0, 255), -1)  # red cursor
-
-            if pred_x is not None and screen_w:
+            if pred_x is not None:
                 ux = np.clip(pred_x / screen_w, 0, 1)
                 uy = np.clip(pred_y / screen_h, 0, 1)
-                gx = int(x1 + ux * mini_w)
-                gy = int(y1 + uy * mini_h)
-                cv2.circle(frame, (gx, gy), 4, (0, 255, 0), -1)  # green gaze
+                gx = int(ux * w)
+                gy = int(uy * h)
+                cv2.drawMarker(frame, (gx, gy), (0, 255, 0), cv2.MARKER_CROSS, 22, 2)
+                cv2.circle(frame, (gx, gy), 10, (0, 255, 0), 2)
+
+        # Mini screen map (top-right) for reference
+        x1 = w - mini_w - 10
+        y1 = 10
+        x2 = x1 + mini_w
+        y2 = y1 + mini_h
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 255), 1)
+
+        if auto_active and auto_idx < len(targets):
+            tx, ty = targets[auto_idx]
+            ux = np.clip(tx / screen_w, 0, 1)
+            uy = np.clip(ty / screen_h, 0, 1)
+            cx = int(x1 + ux * mini_w)
+            cy = int(y1 + uy * mini_h)
+            cv2.circle(frame, (cx, cy), 6, (0, 0, 255), -1)
+
+        if pred_x is not None:
+            ux = np.clip(pred_x / screen_w, 0, 1)
+            uy = np.clip(pred_y / screen_h, 0, 1)
+            gx = int(x1 + ux * mini_w)
+            gy = int(y1 + uy * mini_h)
+            cv2.circle(frame, (gx, gy), 6, (0, 255, 0), -1)
 
         cv2.imshow("Gaze Demo (UnityEyes -> MPIIFaceGaze)", frame)
 
@@ -312,19 +368,22 @@ def main():
         if key == ord("q"):
             break
         elif key == ord("c"):
-            if not use_cursor:
-                print("pyautogui not available. Install it or run without --no-cursor.")
-            else:
-                print("Starting calibration: look at your cursor and move it around.")
-                collecting = True
-                calib_yps.clear()
-                calib_xys.clear()
+            auto_active = True
+            auto_phase = "settle"
+            auto_idx = 0
+            phase_start_t = time.time()
+            calib_yps.clear()
+            calib_xys.clear()
+            A = None
+            print("Auto calibration started. Follow the red dot.")
         elif key == ord("r"):
             print("Calibration reset.")
             A = None
-            collecting = False
+            auto_active = False
+            auto_phase = "idle"
             calib_yps.clear()
             calib_xys.clear()
+            prev_yp = None
 
     cap.release()
     cv2.destroyAllWindows()
