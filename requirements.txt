@@ -3,3 +3,4 @@ torchvision>=0.15
 tqdm>=4.64
 numpy>=1.23
 Pillow>=9.0
+opencv-python>=4.5

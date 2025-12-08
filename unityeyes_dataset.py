@@ -11,14 +11,21 @@ from torchvision import transforms as T
 
 
 def _default_transform(image_size: int, augment: bool) -> T.Compose:
-    """Create basic image transforms for UnityEyes samples."""
+    """Create basic image transforms for UnityEyes samples.
+
+    Note: we deliberately avoid horizontal flips here. Flipping the image
+    would require flipping the yaw label as well; since we're not doing
+    label-aware transforms in this module, we keep the geometry fixed.
+    """
     aug: List[torch.nn.Module] = []
     if augment:
-        aug.extend(
-            [
-                T.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05, hue=0.02),
-                T.RandomHorizontalFlip(p=0.5),
-            ]
+        aug.append(
+            T.ColorJitter(
+                brightness=0.1,
+                contrast=0.1,
+                saturation=0.05,
+                hue=0.02,
+            )
         )
 
     aug.extend(
@@ -37,7 +44,13 @@ def _parse_look_vec(raw: object) -> Optional[List[float]]:
         return None
     if isinstance(raw, str):
         # Strings often look like "(0.8372, 0.1541, -0.5248, 0.0000)"
-        cleaned = raw.strip().replace("(", "").replace(")", "").replace("[", "").replace("]", "")
+        cleaned = (
+            raw.strip()
+            .replace("(", "")
+            .replace(")", "")
+            .replace("[", "")
+            .replace("]", "")
+        )
         parts = [p for p in cleaned.replace(",", " ").split() if p]
         try:
             return [float(p) for p in parts]
@@ -119,7 +132,8 @@ class UnityEyesDataset(Dataset):
                 label_path = img_path.with_suffix(".json")
                 if label_path.exists():
                     samples.append((img_path, label_path))
-        return sorted(samples, key=lambda p: str(p[0]))
+        samples.sort(key=lambda p: str(p[0]))
+        return samples
 
     def __len__(self) -> int:
         return len(self.samples)

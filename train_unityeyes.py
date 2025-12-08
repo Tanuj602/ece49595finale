@@ -4,7 +4,7 @@ from typing import Tuple
 
 import torch
 from torch import nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 from torchvision import models
 from tqdm import tqdm
 
@@ -30,7 +30,8 @@ def build_model(from_scratch: bool = False) -> nn.Module:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Pre-train a gaze model on UnityEyes.")
     parser.add_argument("--data-root", type=Path, required=True, help="Path to UnityEyes dataset root.")
-    parser.add_argument("--out-dir", type=Path, default=Path("runs/unityeyes_pretrain"), help="Directory to save checkpoints.")
+    parser.add_argument("--out-dir", type=Path, default=Path("runs/unityeyes_pretrain"),
+                        help="Directory to save checkpoints.")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -45,10 +46,39 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def split_dataset(dataset: UnityEyesDataset, val_split: float, seed: int) -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset]:
-    val_size = max(1, int(len(dataset) * val_split))
-    train_size = len(dataset) - val_size
-    return random_split(dataset, lengths=[train_size, val_size], generator=torch.Generator().manual_seed(seed))
+def create_train_val_datasets(
+    data_root: Path,
+    image_size: int,
+    val_split: float,
+    augment: bool,
+    seed: int,
+) -> Tuple[torch.utils.data.Dataset, torch.utils.data.Dataset]:
+    """Build separate train/val datasets with shared index split."""
+    # Training dataset: with augmentation (if enabled)
+    base_train = UnityEyesDataset(
+        root=data_root,
+        image_size=image_size,
+        augment=augment,
+    )
+    # Validation dataset: same samples, but NO augmentation
+    base_val = UnityEyesDataset(
+        root=data_root,
+        image_size=image_size,
+        augment=False,
+    )
+
+    n = len(base_train)
+    val_size = max(1, int(n * val_split))
+    train_size = n - val_size
+
+    g = torch.Generator().manual_seed(seed)
+    indices = torch.randperm(n, generator=g)
+    train_idx = indices[:train_size]
+    val_idx = indices[train_size:]
+
+    train_ds = Subset(base_train, train_idx)
+    val_ds = Subset(base_val, val_idx)
+    return train_ds, val_ds
 
 
 def train_one_epoch(
@@ -94,12 +124,13 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = torch.device("cpu" if args.cpu or not torch.cuda.is_available() else "cuda")
 
-    dataset = UnityEyesDataset(
-        root=args.data_root,
+    train_ds, val_ds = create_train_val_datasets(
+        data_root=args.data_root,
         image_size=args.image_size,
+        val_split=args.val_split,
         augment=not args.no_augment,
+        seed=args.seed,
     )
-    train_ds, val_ds = split_dataset(dataset, val_split=args.val_split, seed=args.seed)
 
     train_loader = DataLoader(
         train_ds,
